@@ -1,122 +1,271 @@
-## Rate Limiting
-- It controls how many requests a client can make in a given period.
+# Rate Limiter Service
 
-### Why Rate Limiting?
-- Prevent abuse and spam
-- Protect APIs from too many requests
-- Reduce server overload
-- Protect login/payment APIs from brute-force attacks
-- Improve availability and fairness
+A small service that stops users from sending too many requests to an API. It supports 3 rate limiting algorithms (Fixed Window, Token Bucket, Sliding Window), and each route can pick the one that suits it.
 
-<br>
 
-## 🧠 Core System Concepts
 
-- **Race Conditions (The Glitch):** If a user clicks a button twice at the exact same millisecond, two separate requests hit your server at the same time. Both requests might read the old number from the database before either finished updating it. This causes a counting glitch called a race condition.
+## The problem it solves
 
-- **Lua Scripts (The Single-Shot Fix):** To fix the counting glitch, we use a Lua script (a tiny script that runs directly inside the database). Instead of the server sending a request, waiting, and sending another request (which creates a back-and-forth delay, the "ping-pong" problem), the Lua script forces the database to run all steps (Read, Math, Write) in one single, un-interruptible shot. This guarantees 100% accurate counting.
+If one user (or a bot) sends thousands of requests, the API becomes slow for everyone. It also helps against:
 
-- **Fail-Open Strategy (Keep the App Running):** If your database crashes or goes offline, your rate limiter middleware will fail. The best practice is to **Fail-Open**. This means your code catches the error, logs it to a tracking system, and lets the user through anyway. It is much better to temporarily lose your rate limiter than to completely crash the entire website for all your regular customers.
+- password guessing on login (brute force)
+- scraping and spamming
+- one buggy client that loops forever
+- unfair use of expensive routes (upload, search)
+- cost overruns on paid services
 
-### What is Lua?
+## Real-world use
 
-- Lua is a very small, lightweight, and incredibly fast programming language.
-- Redis has a Lua engine built right inside it. This means Redis can read and execute Lua code directly inside its own memory.
+- Login and OTP routes (strict, few tries)
+- Public APIs (free plan: 100 requests per minute)
+- Search and autocomplete (bursts are normal, so allow them)
+- File uploads and emails (hourly or daily caps)
+- API gateways, which almost always include a rate limiter
 
-### Why do we need it? (The "Ping-Pong" Problem)
+## Tech stack and why each piece is there
 
-In your Token Bucket algorithm, your code has to do multiple steps:
+| Tech                      | Why I used it                                                                                               |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Node.js and Express       | The API and the middleware                                                                                  |
+| Redis                     | Fast shared counters. The numbers stay correct even if the server restarts, and many servers can share them |
+| Lua scripts (in Redis)    | Make "read, calculate, write" one unbreakable step                                                          |
+| ioredis                   | The Redis client (it can define Lua commands)                                                               |
+| Docker and Docker Compose | One command to run the app and Redis                                                                        |
+| node:test                 | Tests                                                                                                       |
+| Postman                   | Manual testing                                                                                              |
 
-1. Get the current tokens (`HGET`).
-2. Calculate the math in JavaScript (how much time passed, add tokens).
-3. Check if tokens are at least 1 (`if`).
-4. Save the new tokens back to Redis (`HSET`).
+## Big picture flow
 
-**Without Lua (The Slow Way):**
+1. A request comes in.
+2. It passes through the **global limiter** first (a loose limit for everyone).
+3. Then it passes through the **route limiter** of its own route (strict for sensitive routes).
+4. If both say OK, the route handler runs and replies 200.
+5. If either says no, the reply is 429 and the handler never runs.
+6. Every decision is counted (allowed or blocked) for the stats endpoint.
 
-Node.js has to play "ping-pong" with Redis over the network:
+Counters live in Redis, so they survive a server restart.
 
-- Node.js asks Redis: "Give me the tokens." (Network trip 1)
-- Redis answers: "Here they are." (Network trip 2)
-- Node.js does the math...
-- Node.js tells Redis: "Okay, now save the new count." (Network trip 3)
+## Folder and file guide
 
-If two requests from the same user arrive at the exact same millisecond, Node.js might read the tokens for both requests before saving the first one. This creates a glitch (called a **Race Condition**) where the rate limiter miscounts and breaks.
+| File                                  | Job                                                             |
+| ------------------------------------- | --------------------------------------------------------------- |
+| `src/server.js`                       | Starts the server                                               |
+| `src/app.js`                          | Builds the Express app, applies limiters to routes              |
+| `src/redis.js`                        | Redis connection (also defines the Lua commands)                |
+| `src/config/limits.js`                | All rate limit rules in one place                               |
+| `src/middleware/fixedWindow.js`       | Fixed Window algorithm                                          |
+| `src/middleware/tokenBucket.js`       | Token Bucket algorithm (Lua)                                    |
+| `src/middleware/slidingWindow.js`     | Sliding Window algorithm (Lua)                                  |
+| `src/middleware/rateLimit.js`         | Picks the algorithm from the config and adds the stats counting |
+| `tests/limiter.test.js`               | Tests for all 3 algorithms                                      |
+| `Dockerfile` and `docker-compose.yml` | Run app and Redis together                                      |
 
-**With Lua (The Fast, Atomic Way):**
+## The 3 algorithms in simple words
 
-Instead of sending data back and forth, you ship the entire recipe (the Lua script) straight into Redis.
+### Fixed Window
 
-- Redis locks your database for a split second.
-- It runs all the steps (Get, Math, If, Save) internally in one single shot.
-- It just hands Node.js a final answer: `[allowed, remaining]`.
+Count requests inside each fixed time slot (for example each clock minute). When the slot ends, the count resets.
 
-No ping-pong, no glitches. This single-shot execution is called **Atomic**.
+- Redis steps: `INCR key`. If the result is 1, set `EXPIRE` (the window length). If the result is more than the limit, block.
+- Memory: 1 number per user.
+- Weakness (the boundary loophole): a user can send 5 requests at 12:00:59 and 5 more at 12:01:00. That is 10 requests in 2 seconds, although the limit is 5 per minute.
+- Good for: rough limits where precision isn't important.
 
----
+### Token Bucket
 
-<br>
+Imagine a bucket that holds tokens. Each request takes one token. The bucket refills slowly (for example 5 tokens per second) up to its capacity.
 
-## 🕒 Fixed Window Limiter
+- Redis stores 2 numbers per user: how many tokens are left, and the time of the last refill.
+- On each request, a Lua script calculates how many tokens were added since the last time, takes one if available, and saves.
+- Allows **bursts on purpose**: a full bucket of 20 lets a user send 20 requests at once, but the long-term speed is limited by the refill rate.
+- Good for: search, autocomplete, normal API traffic.
 
-> **The Core Idea:** You split time into strict boxes, like a 1-minute window. Users get a counter that resets to zero every time a new minute begins.
+### Sliding Window
 
-### How it Works (Step-by-Step)
+Look back exactly 60 seconds from **right now** and count the requests in that period.
 
-1. **Identify:** Look up the user's IP address (their digital location).
-2. **Check First:** Look at their current count in the database. If the count is already over the limit, block them immediately. (This stops hackers from adding to the counter forever and running your database out of memory.)
-3. **Add 1:** If they are under the limit, add 1 to their counter.
-4. **Start Timer:** If it is their very first request, start a countdown timer (e.g., 60 seconds) so the counter automatically deletes itself when the minute ends.
+- Redis keeps a **sorted set** per user. Each request is an entry with its time as the score.
+- Lua script steps: 1) remove entries older than the window, 2) count what is left, 3) if below the limit add this request, otherwise block, 4) when blocked, calculate how long until the oldest entry leaves the window (this is the `Retry-After`).
+- Each entry gets a unique ID (`randomUUID`) because a sorted set can't hold two identical items. Without it, two requests in the same millisecond would overwrite each other.
+- No boundary loophole, because the window moves with every request.
+- Memory: 1 entry per request in the window (the most expensive of the three).
+- Good for: strict limits such as login.
 
-### ⚖️ The Pros & Cons
+### Comparison
 
-- 🟢 **Pros:** Super fast, incredibly simple to code, and takes up almost zero database memory.
-- 🔴 **Cons (The Boundary Flaw):** It has a time-border trick. If a user is allowed 100 requests per minute, they could send 100 requests at 11:59 AM and another 100 requests at 12:00 PM. They successfully bypassed the limiter by sending 200 requests in 2 seconds right at the border where the minute changes.
+|                   | Fixed Window                            | Token Bucket                  | Sliding Window                        |
+| ----------------- | --------------------------------------- | ----------------------------- | ------------------------------------- |
+| Idea              | Count per fixed slot                    | Bucket of tokens that refills | Count in the last 60 seconds from now |
+| Boundary loophole | Yes (up to 2x the limit near the reset) | No                            | No                                    |
+| Bursts            | Accidentally                            | Yes, on purpose               | Up to the limit                       |
+| Memory per user   | 1 number                                | 2 numbers                     | 1 entry per request                   |
+| Precision         | Low                                     | Good                          | Highest                               |
+| Best for          | Simple rough limits                     | Bursty but smooth APIs        | Strict limits like login              |
 
----
+## Rules used in this project (`src/config/limits.js`)
 
-<br>
+| Rule   | Algorithm      | Limit                           |
+| ------ | -------------- | ------------------------------- |
+| global | Sliding Window | 100 requests per 60 seconds     |
+| login  | Sliding Window | 5 requests per 60 seconds       |
+| search | Token Bucket   | 20 tokens, refills 5 per second |
+| upload | Fixed Window   | 10 requests per hour            |
 
-## 🪣 Token Bucket Limiter
+Why each choice (the decision rules):
 
-> **The Core Idea:** Think of a physical bucket filled with water tokens (e.g., max 5 tokens). Every click scoops out 1 token. A faucet constantly drips new tokens back into the bucket over time (e.g., 1 token per second).
+- **login = Sliding Window:** strict, no loophole, because attackers will try to exploit the boundary.
+- **search = Token Bucket:** real users type fast in bursts, so bursts should be allowed, but the average speed stays limited.
+- **upload = Fixed Window:** a simple hourly cap is enough. One hour is long, so the boundary loophole matters little, and it costs only 1 number of memory.
+- **global = Sliding Window:** a fair, accurate cap for everything.
 
-### How it Works (Step-by-Step)
+## Routes
 
-This entire math logic runs inside a Lua script directly inside the database to prevent the back-and-forth (ping-pong) network delays:
+| Method | Route   | Limited by      | What it does                        |
+| ------ | ------- | --------------- | ----------------------------------- |
+| GET    | /health | nothing         | Checks the server is running        |
+| GET    | /stats  | nothing         | Allowed and blocked counts per rule |
+| DELETE | /stats  | nothing         | Resets the counts                   |
+| POST   | /login  | global + login  | Demo route with a strict limit      |
+| GET    | /search | global + search | Demo route that allows bursts       |
+| POST   | /upload | global + upload | Demo route with an hourly cap       |
+| GET    | /       | global          | Home route                          |
 
-1. **Fetch:** Read the bucket's current tokens and the exact time of the user's last visit.
-2. **Refill Math:** Check how much time passed since their last visit. Turn that time into new tokens and add them back to the bucket (but never go over the maximum bucket size).
-3. **Take a Token:** If the bucket has at least 1 token, take 1 token away and let the user through. If the bucket is empty, block them.
-4. **Clean Up:** Save the new token count and time. Set a self-destruct timer on the bucket. If the user leaves your site and doesn't come back, the bucket automatically deletes itself from memory to save server space.
+When blocked: status 429. Token Bucket and Sliding Window also send `X-RateLimit-Remaining` and `Retry-After` headers.
 
-### ⚖️ The Pros & Cons
+## How `rateLimit.js` and the stats work
 
-- 🟢 **Pros:** Completely fixes the time-border trick. It allows small bursts of fast clicks (up to the bucket size) but smoothly slows down continuous spam. It is highly secure because blocked requests freeze at 0 tokens and never drop below zero.
-- 🔴 **Cons:** Harder to write and requires learning how to pass scripts to your database.
+- Each limiter is a middleware function: `(req, res, next)`. It either calls `next()` (allowed) or replies 429.
+- `rateLimit.js` reads the rule from the config, builds the right limiter, and **wraps** it (the decorator idea).
+- The wrapper gives the limiter a **fake `next`** called `markAllowed`. If the limiter calls it, the request was allowed, so the wrapper counts "allowed" and then calls the real `next()`. If the limiter instead sends a 429 reply, `markAllowed` was never called, so the wrapper counts "blocked".
+- Result: every algorithm gets stats **without changing its own code**.
+- Stats are kept per rule name (global, login, search, upload).
 
----
+Dry run for `POST /login` the 6th time in a minute:
 
-<br>
+1. Global limiter (sliding, 100 per minute): the user is under 100, so it allows. Stats: global allowed +1.
+2. Login limiter (sliding, 5 per minute): there are already 5 entries in the last 60 seconds, so it blocks and replies 429 with `Retry-After`. Stats: login blocked +1.
+3. The route handler never runs.
 
-## 🕒 Sliding Window Log Limiter
+## Redis keys and ids
 
-> **The Core Idea:** Think of this like a security camera recording the last 60 seconds of a doorway. As time ticks forward, the 60-second window slides along with it. Instead of counting numbers, the database writes down an exact timestamp log (a history record) of every single click.
+- The limiter key is built from the client IP and the rule name (for example `sliding:<ip>`), so a user's login attempts never mix with their search requests.
+- Each rule has its own Redis key.
+- The tests use **Redis database 1**, so real data in database 0 is never touched.
 
-To keep this timeline organized, it uses a **Redis Sorted Set** (a specialized database list that automatically keeps items in order from oldest to newest based on a score, which in this case is the time of the click).
+## Design decisions
 
-### How it Works (Step-by-Step)
+- **Atomic Lua scripts:** Token Bucket and Sliding Window read, calculate and write inside Redis in one step. Without that, two requests at the same millisecond could both read the same old count and both slip through (a race condition). Redis runs a Lua script as one unit, and nothing runs in between.
+- **Increment first, then compare** (Fixed Window): add 1, then check the number you got back. Checking first and adding later lets one extra request through.
+- **Fail open:** if Redis is down, requests are allowed. A Redis problem should not take the whole API down. For very sensitive routes (login) some teams choose fail closed. It's a trade-off between availability and protection.
+- **Config-driven rules:** changing the algorithm for a route is a one-word change in the config file.
+- **Stats wrapper:** counting is done in one place.
+- **Global plus route limiter:** loose limit for everyone, strict for sensitive routes.
+- **Separate counters per rule:** no mixing between routes.
+- **Unique member IDs** in the sliding window set.
+- **Docker Compose:** the same one-command start for anyone.
 
-This math logic runs inside a Lua script directly inside the database to prevent back-and-forth (ping-pong) network delays:
+## Bugs I hit and how I fixed them
 
-1. **Throw Away the Past:** The script checks the current time and deletes any old logs that are older than the time window (e.g., if your window is 60 seconds, it instantly wipes out clicks from 61 seconds ago) using the command `ZREMRANGEBYSCORE`.
-2. **Count the Rest:** It counts how many timestamps are left in the list using `ZCARD`.
-3. **Write Down the Click:** If the count is below your limit, it adds the current request's time to the list using `ZADD` (using a unique ID called a `randomUUID` to make sure every click is a separate item) and lets the user through.
-4. **Calculate Wait Time:** If the bucket is full, it looks at the oldest click in the list. It does quick math to figure out exactly how many milliseconds the user has to wait until that oldest click drops off the timeline, and tells the user exactly when to try again (`Retry-After`).
+| Problem                                                            | Cause                                                                    | Fix                                                                                                                                       |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| The 11th upload got 200 instead of 429 (test showed `200 !== 429`) | Off by one: the first version checked the old count and then incremented | Increment first with `INCR`, then compare the returned count with the limit. I made this correction in my own version of `fixedWindow.js` |
+| Why that bug is also a race                                        | Two requests could both read the same old count                          | `INCR` is atomic in Redis, so each request gets its own number                                                                            |
+| Port 6379 already in use                                           | Another Redis was running                                                | Stop the other Redis, or change the port                                                                                                  |
 
-### ⚖️ The Pros & Cons
+## Tests
 
-- 🟢 **Pros:** This is the most accurate rate limiter possible. It completely obliterates the time-border trick found in the Fixed Window algorithm. It tracks a continuous, rolling window perfectly down to the millisecond.
-- 🔴 **Cons (The Memory Hog):** Because it saves a unique timestamp for every single request, it uses a massive amount of database memory (RAM). If a hacker attacks you with 1,000,000 requests, your database has to store 1,000,000 text logs. (Note: Your Lua script handles this gracefully by dropping old items first, but it still takes up way more space than just storing a single number).
+- Run with `npm test`. Redis must be running on port 6379.
+- Tests use Redis database 1.
+- They cover all 3 algorithms: allowed under the limit, blocked over the limit, the headers, and recovery after the window or refill.
 
----
+## Run it
+
+- Docker: `docker compose up --build`, then open `http://localhost:3000/stats`.
+- Without Docker: start Redis with `docker run -d --name my-redis -p 6379:6379 redis`, then `npm install`, copy `.env.example` to `.env`, and `npm start`.
+
+## Limitations and future work
+
+- Limits by IP only (users behind one network share a limit). Better: limit by user ID or API key when logged in.
+- Behind a proxy or load balancer, `req.ip` needs `trust proxy` set, otherwise everyone looks like the same IP.
+- Rules are fixed in a file. They could be loaded from a database and changed at runtime.
+- Single Redis. For high availability use Redis Sentinel or Cluster.
+- No dashboard UI for the stats yet.
+- Could be packaged as an npm library or run as a separate service for other apps.
+
+## How others can use it
+
+- As middleware inside their Express app (copy the middleware and config).
+- As a separate service in front of other services (an API gateway pattern).
+- Changing limits only needs the config file.
+
+## How to scale it
+
+- Run many app servers that share one Redis. Since all counters live in Redis, the limit stays correct across servers.
+- Use Redis Cluster and shard by key if one Redis is not enough.
+- Local in-memory caches can cut Redis calls for very hot keys, with slightly less accuracy.
+
+## Commands to remember
+
+```
+docker compose up --build        run app and Redis
+docker run -d --name my-redis -p 6379:6379 redis
+npm start                        start the server
+npm test                         run tests
+```
+
+## 30-second pitch
+
+"I built a rate limiter service with Node, Express and Redis. It implements three algorithms: Fixed Window, Token Bucket and Sliding Window, and each route picks one from a config file. I used Redis Lua scripts so the check is atomic, which stops two simultaneous requests from slipping past the limit. It has a global limit and strict limits on routes like login, a stats endpoint showing allowed and blocked counts, tests for all three algorithms, and it runs with Docker Compose."
+
+## Interview questions and answers
+
+**Why do you need a rate limiter?**
+To protect the API from abuse and overload, keep it fair for all users, and slow down attacks like password guessing.
+
+**Why 3 algorithms, and how do you choose?**
+Each fits a different need. Fixed Window is the simplest and cheapest. Token Bucket allows bursts and keeps the average rate limited. Sliding Window is the most accurate and has no boundary loophole. I choose by the route: sliding for login, token bucket for search, fixed for an hourly upload cap.
+
+**What is the boundary problem in Fixed Window?**
+A user can use the full limit at the end of one window and the full limit again at the start of the next, so they send up to twice the limit in a short time.
+
+**Why Redis and not a variable in Node's memory?**
+Memory is lost on restart, and it is not shared between several servers. Redis is shared, fast and has built-in expiry.
+
+**Why Lua scripts?**
+Reading a value, calculating and writing it back are 3 steps. Two requests could interleave between the steps and both pass. A Lua script runs in Redis as one atomic unit.
+
+**Why does `INCR` solve the Fixed Window race?**
+`INCR` is atomic and returns the new number. Each request gets a different number, so only the ones under the limit pass.
+
+**Explain the off-by-one bug you found.**
+My first version read the count, compared it with the limit and then incremented. That allowed one extra request. The fix is to increment first, then compare the returned number with the limit. My own test caught it: the 11th upload returned 200 instead of 429.
+
+**What does fail open mean? Is it always right?**
+If Redis is down, the limiter lets requests through. That keeps the API available. For security-critical routes some teams prefer fail closed. It is a choice between availability and protection.
+
+**How does Token Bucket work internally?**
+It stores the token count and the last refill time. On each request, the script adds `elapsed seconds times refill rate` tokens (up to the capacity), then takes one if at least one is available.
+
+**Why a sorted set for Sliding Window? Why a unique ID per entry?**
+A sorted set keeps entries ordered by time and lets me delete everything older than the window by score in one command. The unique ID stops two requests with the same timestamp from overwriting each other.
+
+**How do you tell the client when to retry?**
+The `Retry-After` header. For sliding window it is the time until the oldest entry leaves the window.
+
+**How do you count allowed and blocked requests without editing each algorithm?**
+A wrapper passes a fake `next` called `markAllowed` to the limiter. If the limiter calls it, the request was allowed. If it sends a 429 instead, it wasn't called, so it was blocked.
+
+**What are the weaknesses?**
+It limits by IP, so many users behind one network share a limit. It depends on one Redis. And behind a proxy I must configure `trust proxy`.
+
+**How would you scale this to many servers?**
+All servers share the same Redis, so the counters are global. For more load, use Redis Cluster.
+
+**How would you rate limit by user instead of IP?**
+Use the user ID from the JWT in the key when the user is logged in, and fall back to IP for anonymous users.
+
+**What would you improve with more time?**
+Per-user and per-API-key limits, rules from a database, a dashboard, a library version, and sticky limits for very sensitive routes.
+
+**What did you learn?**
+Concurrency bugs are invisible until you test with simultaneous requests, atomic operations matter, and the right algorithm depends on what the route needs.
