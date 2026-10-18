@@ -1,0 +1,194 @@
+{
+  "info": {
+    "_postman_id": "62f437fd-97da-41d6-a375-fd4b5a7335de",
+    "name": "Rate Limiter Service API",
+    "description": "## 🚦 Rate Limiter Service\n\n**Tech Stack:** Node.js · Express · Redis\n\nA configurable rate-limiting service that protects API routes from excessive requests. It supports three algorithms—**Fixed Window, Token Bucket, and Sliding Window**—with route-specific settings defined in `src/config/limits.js`.\n\n### ⚙️ Getting Started\n\n1. docker compose up -d\n    \n2. Start the backend server.\n    \n3. Ensure the server URL matches the `rateLimiterUrl` variable in the Postman collection.\n    \n\n### 🛡️ Rate Limit Rules\n\nThe global limiter applies to routes covered by it. Individual routes also use their configured limits.\n\n| Limiter | Algorithm | Limit |\n| --- | --- | --- |\n| `global` | Sliding Window | 100 requests per 60 seconds |\n| `login` | Sliding Window | 5 requests per 60 seconds |\n| `search` | Token Bucket | 20-token capacity; refills at 5 tokens/second |\n| `upload` | Fixed Window | 10 requests per hour |\n\n### 🚫 Rate-Limit Responses\n\nWhen a request exceeds its configured limit, the service responds with **`429 Too Many Requests`**.\n\nToken Bucket and Sliding Window responses also include:\n\n- `X-RateLimit-Remaining` — remaining request allowance or tokens.\n    \n- `Retry-After` — how long to wait before retrying.\n    \n\n### 🧪 Testing in Postman\n\nUse the requests in this collection to test the health endpoint and routes protected by different limiters. Send requests repeatedly until the applicable limit is reached, then inspect the response status and headers.\n\n### ⚙️ Collection Variable\n\n| Variable | Purpose |\n| --- | --- |\n| `rateLimiterUrl` | Base URL of the backend server |",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "43541656"
+  },
+  "item": [
+    {
+      "name": "Monitoring",
+      "item": [
+        {
+          "name": "Health check",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{rateLimiterUrl}}/health",
+              "host": [
+                "{{rateLimiterUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": "Checks that the server is running.\n\n**Auth:** none\n**Rate limited:** no\n**Success:** `200` with `{ \"status\": \"ok\" }`"
+          },
+          "response": []
+        },
+        {
+          "name": "Get stats",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{rateLimiterUrl}}/stats",
+              "host": [
+                "{{rateLimiterUrl}}"
+              ],
+              "path": [
+                "stats"
+              ]
+            },
+            "description": "Shows how many requests were allowed and blocked for every rule (global, login, search, upload), plus the totals and `blockedPercent`.\n\nStats are counted per **rule**, not per route. One request to `/login` is counted twice: once in `global` and once in `login`.\n\n**Auth:** none\n**Rate limited:** no\n**Success:** `200`"
+          },
+          "response": []
+        },
+        {
+          "name": "Reset stats",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{rateLimiterUrl}}/stats",
+              "host": [
+                "{{rateLimiterUrl}}"
+              ],
+              "path": [
+                "stats"
+              ]
+            },
+            "description": "Clears all the allowed/blocked counters. Handy before a test. It does not clear the rate limit counters themselves.\n\n**Auth:** none\n**Rate limited:** no\n**Success:** `200` with `{ \"message\": \"Stats reset\" }`"
+          },
+          "response": []
+        }
+      ],
+      "description": "Routes for checking the server and the counters. They are registered above the global limiter, so they are never rate limited."
+    },
+    {
+      "name": "Rate limited routes",
+      "item": [
+        {
+          "name": "Login (sliding window, 5 per minute)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{rateLimiterUrl}}/login",
+              "host": [
+                "{{rateLimiterUrl}}"
+              ],
+              "path": [
+                "login"
+              ]
+            },
+            "description": "Passes the **global** limiter first, then the **login** limiter (sliding window, 5 requests per 60 seconds).\n\n**Try it:** send this request 6 times quickly. The first 5 return `200`, and the 6th returns `429` with a `Retry-After` header.\n\n**Why sliding window here:** login needs the most accurate limit. It looks back a full 60 seconds from now, so there is no reset-boundary loophole.\n\n**Counted in stats:** `global` and `login`"
+          },
+          "response": []
+        },
+        {
+          "name": "Search (token bucket)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{rateLimiterUrl}}/search",
+              "host": [
+                "{{rateLimiterUrl}}"
+              ],
+              "path": [
+                "search"
+              ]
+            },
+            "description": "Passes the **global** limiter, then the **search** limiter (token bucket: 20 tokens, refills 5 per second).\n\n**Try it:** send 21 requests quickly. The bucket allows a burst of 20, and then returns `429` until tokens refill. The header `X-RateLimit-Remaining` shows the tokens left.\n\n**Why token bucket here:** real users type in bursts. A full bucket allows that on purpose, and the slow refill keeps the traffic smooth.\n\n**Counted in stats:** `global` and `search`"
+          },
+          "response": []
+        },
+        {
+          "name": "Upload (fixed window, 10 per hour)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{rateLimiterUrl}}/upload",
+              "host": [
+                "{{rateLimiterUrl}}"
+              ],
+              "path": [
+                "upload"
+              ]
+            },
+            "description": "Passes the **global** limiter, then the **upload** limiter (fixed window, 10 requests per 3600 seconds).\n\n**Try it:** send 11 requests. The 11th returns `429`. The counter resets when the window key expires.\n\n**Why fixed window here:** a rough hourly cap is enough, and it is the simplest and cheapest algorithm.\n\n**Counted in stats:** `global` and `upload`"
+          },
+          "response": []
+        },
+        {
+          "name": "Home (global limit only)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{rateLimiterUrl}}/",
+              "host": [
+                "{{rateLimiterUrl}}"
+              ],
+              "path": [
+                ""
+              ]
+            },
+            "description": "Only the **global** limiter applies here (sliding window, 100 requests per 60 seconds).\n\n**Counted in stats:** `global`"
+          },
+          "response": []
+        }
+      ],
+      "description": "Demo routes that show each algorithm. Send the same request many times quickly to see the `429`. These requests have no automatic status test on purpose, because a `429` is the expected result after the limit is crossed."
+    }
+  ],
+  "variable": [
+    {
+      "key": "rateLimiterUrl",
+      "value": "http://localhost:3000"
+    }
+  ]
+}
